@@ -1,141 +1,282 @@
 # poker_bot_nolimit
 
-A tournament bot for a no-limit Hold'em variant where every player is dealt **three** hole cards, then after the flop must secretly discard one and publicly **reveal** one of the two they keep. I built it for the No Limits poker bot competition (hosted by Citadel, OpenAI and Sequoia).
+My tournament bot for the No Limits poker bot competition (hosted by Citadel, OpenAI and Sequoia). The game is **`flop_discard_reveal`** ("Bay Area"), a no-limit hold'em variant: everyone gets three hole cards, and after the flop each player discards one and shows one.
 
-The bot is plain Python with no third-party dependencies beyond the competition SDK (`poker_agent_sdk`, supplied by the organizers and not included here). It is rule-based, not a solver: a ranked starting-hand table, a position- and stack-aware betting policy, a small Bayesian opponent model, and an exact river calculator that exploits the revealed card.
+The strategy is **heuristic and rule-based. It is not a solver and does not play GTO.** It is made of:
 
-## The variant
+- a precomputed three-card preflop ranking;
+- position-, stack- and payout-aware betting rules;
+- seat statistics kept in table memory;
+- an exact river calculator. It uses an opponent's exposed card to prove some calls win or lose.
 
-| Stage | What happens |
+This README is in four parts: **game rules** (from the organizers' starter kit), **what the code does** (the current V5 code), **history** (how the code got here), and **open questions** (things not verified).
+
+---
+
+## 1. Game rules
+
+From the starter kit:
+
+| Stage | Rule |
 |---|---|
-| Deal | Each player gets 3 hole cards. Blinds and (at later levels) antes are posted. |
-| Preflop | Normal no-limit betting, but on 3-card hands. |
-| Flop | 3 community cards. |
-| Select | Every remaining player, simultaneously and without seeing anyone else's choice, discards 1 card (dead for the rest of the hand) and picks 1 of the 2 kept cards to show face up. |
-| Flop betting, turn, river | Standard no-limit betting. From here on everyone plays a normal 2-card Hold'em hand, except each opponent's hand is half-public. |
-| Showdown | Best five of 2 hole cards + 5 board cards. |
+| Deal | 2–10 players. Each gets **three** private cards. |
+| Preflop | Standard no-limit betting on three-card hands. |
+| Flop | Three board cards. |
+| Select | Before flop betting, every remaining player (including all-in players) picks at the same time: one card to **discard** face down and one kept card to **expose**. All choices are locked before any exposure is shown. |
+| Flop / turn / river betting | Each player now has two cards, one face up and one face down. |
+| Showdown | Automatic: best five from the two kept cards plus the board. Discards never play. Opponents' discards are never shown. |
 
-Tournament and platform rules that shaped the design:
+**Tournament defaults:** 8 players, 2,000 chips each, blinds go up every 20 hands, hand cap of 250. Payouts are 50/30/20 points by default but can be changed (`state.config.payouts`). Places still open at the hand cap are paid by ICM. **The bot is scored on payout points, not chips.**
 
-- **Multi-table freezeout.** Up to 10 seats per table, rising blind levels with antes, and a payout table, so chip EV is not the same as prize EV near the money.
-- **Stateless agent.** `act(state, memory)` is called for every decision. Nothing may persist between calls except an opaque per-table `memory` byte string (capped by `state.config.memory_bytes`, at most 16 KB). All opponent modelling has to be serialized into it.
-- **Legal-action envelope.** The engine supplies legal actions with min/max raise amounts; any illegal or crashing response costs the hand. Every exit path of the agent is therefore guarded and falls back to check/fold.
+**Runtime contract:**
+- Python 3.12. `class Agent(poker_agent_sdk.Agent)` lives in `agent.py`. `act(state, memory) -> (Action, bytes)`.
+- Each decision has 1 ms, including memory handling. Each table also has a 100 ms time bank.
+- Agent instances can be swapped between calls, so anything learned about a table has to be stored in the returned `memory` bytes. The platform limit is 64 KB by default; the kit recommends staying under 16 KB. Memory can arrive empty, malformed or truncated.
+- At runtime there is no network access, no subprocesses, no background work and no file persistence. `poker_engine` and `pokerkit` are for local testing only and cannot be imported by a submission. Lookup tables that are built once at import and never change are allowed. They do not count as learned state.
+- `Action.raise_to(amount)` gives the **total** bet for the round, not the amount added.
+- Select returns `Action("select", cards=(discard_index, reveal_index))`. The two indexes must differ and be in 0–2. `state.cards` holds three cards before selection and the two kept cards after it.
+- `seats[i].shown_cards` lists public cards. `state.variant["discarded"]` holds **only our own** discard. `state.history` covers the current hand. `state.events` covers everything since our last turn.
+- Failure defaults: a failed bet becomes a check or fold. A failed selection discards index 2 and exposes index 0.
 
-## What the variant changes strategically
+---
 
-1. **Preflop hands are stronger and closer together.** Three cards give three possible two-card holdings, so a "percentile" computed from two-card Hold'em overstates how good a hand is. The bot re-ranks all 22,100 three-card deals at import time.
-2. **The discard is a hand-construction problem.** You choose which two cards to keep after seeing the flop, and so does everyone else. That favours made hands and nut draws, and punishes weak pairs and non-nut draws in multiway pots.
-3. **The reveal leaks information both ways.** On the river, an opponent with one exposed card has only ~44 possible hands. That is small enough to enumerate exactly, and sometimes enough to *prove* a call wins or a call loses.
+## 2. What the code does (V5)
 
-## How a decision is made
+### Module map
+
+```
+agent.py          Agent.act: action precedence, error containment, memory write
+bot/
+  params.py       every constant and feature switch (see "Parameters" below)
+  cards.py        evaluator, three-card preflop ranking, postflop tiers, simple selection
+  selection.py    V4 discard/expose scoring (used, because fix_selection = True)
+  strategy.py     legal-action helpers and the V2 baseline policy
+  stack.py        main policy: position, ICM-style risk factor, preflop, postflop, select
+  aggression.py   premium-hand floor and stack-to-pot commitment rule
+  river.py        heads-up river enumeration, proofs, weighted equity, eligible pot
+  opp.py          decayed seat counters and their parser (BA02 layout)
+  tag_opp.py      V3 evidence counters on top of opp.py (BA03 layout, the one written)
+  diagnostics.py  telemetry header for the last decision (V5G1)
+```
+
+### Action precedence in `agent.py`
 
 ```mermaid
 flowchart TD
-    A[act state, memory] --> B{River and facing a bet?}
-    B -- yes --> C[Enumerate opponent's hidden card<br/>river.bounds]
-    C --> D{Provable win or loss?}
-    D -- yes --> P[Call / fold. Nothing can override this]
-    D -- no --> E[Weighted range equity vs. pot odds<br/>river.decide_river]
-    B -- no --> F
-    E --> F{Low SPR with an overpair, top pair good kicker or better?}
-    F -- yes --> G[Call: pot-committed<br/>aggression.commitment_action]
-    F -- no --> H[Stack-aware policy<br/>stack.decide_stack]
-    H --> I[Select phase: choose discard + reveal]
-    H --> J[Preflop: push/fold, open, 3-bet, defend]
-    H --> K[Postflop: value, pot control, c-bet]
-    P & G & I & J & K --> M[Update opponent stats, write memory]
+    S[act] --> R{river, betting, to_call > 0?}
+    R -- yes --> B[river.bounds -> certainty_action<br/>computed BEFORE touching memory]
+    R -- no --> M
+    B --> M[tag_opp.update memory<br/>on any exception: fresh priors]
+    M --> P{proof?}
+    P -- yes --> A1[take proof action]
+    P -- no, river --> DR[river.decide_river]
+    DR --> C{reason 1-3, or priced reason 4?}
+    A1 --> C
+    C -- no --> CM[aggression.commitment_action]
+    C -- yes --> X
+    CM -- None --> DS[stack.decide_stack]
+    CM -- call --> X
+    DS --> X[any exception: keep the action if one was chosen,<br/>else strategy.passive, else fold]
+    X --> F[final invariant: re-apply proof]
+    F --> W[serialize memory independently]
 ```
 
-Every step runs inside its own `try`. If anything throws, the agent falls back to the cheapest legal passive action. A river proof is reapplied at the very end, so a failure in a later stage cannot replace it.
+1. **River proof first.** When it is the river and we face a bet, `bounds()` and `certainty_action()` run before memory is parsed. A proof depends only on the cards, so a corrupt memory blob cannot block it.
+2. **Opponent update.** `tag_opp.update()` parses the memory and applies `state.events`. If anything fails, it starts over from the priors (`fresh()`).
+3. **River decision.** If there is a proof it wins. Otherwise `decide_river()` gives either a tie-bound call (reason 3) or a priced equity decision (reason 4).
+4. **Commitment override.** `commitment_action()` may turn a fold into a call when we are pot-committed. It is skipped when reason is 1–3 (proof or tie bound). Because `river_price_authoritative = True`, it is also skipped for a priced reason 4 decision.
+5. **Strategy.** If no action has been chosen yet, `decide_stack()` runs with seat labels from `stack.opponent_modes()`.
+6. **Containment.** If an exception is raised after an action exists, that action is kept. Otherwise the agent falls back to `passive()` (check, fold, a default select, or call, in that order), and finally to `Action.fold()`.
+7. **Final invariant.** If a proof exists it replaces whatever action was chosen. The code comment says no risk, board-danger, evidence or fallback logic may override it.
+8. **Memory write.** This happens after the action is fixed, in its own `try`. If it fails, the agent writes a header-only blob, or `b''`, but the chosen action stands.
 
-### 1. Starting hands: `cards.py`
+**Why bookkeeping must never replace a proven river action:** memory is the least trustworthy input. It can be empty, truncated, from an older format, or out of step with the hand. A proven win or loss comes from cards that are certain. If a memory failure could turn a guaranteed call into a fallback fold, a parsing bug would cost real chips. So the proof is computed first, its precedence is recorded, and it is reapplied after every other step.
 
-- Each two-card holding gets a linear score: pair base plus rank, high and low card rank, suited bonus, gap penalty, broadway bonus.
-- A three-card hand scores `best_pair + 0.08 × second_best_pair`, so a backup holding is worth a little.
-- All 22,100 three-card combinations are sorted once at import into a percentile table (`THREE_PCT`). At runtime "is this hand in my top 18%?" is one dictionary lookup.
-- `strength()` is an exact best-five evaluator for 5 to 7 cards. It uses rank counts and per-suit bitmasks (straights are a sliding 5-bit window) instead of looping over the 21 five-card subsets.
-- `tier()` sorts a postflop hand into 0 (air), 1 (weak), 2 (top pair / overpair) or 3 (strong). A hand that only plays the board (e.g. trips on the board plus a kicker) is downgraded.
+### Preflop ranking (`cards.py`): a ranking, not equity
 
-### 2. Discard and reveal: `selection.py`
+- `pair_score()` gives every two-card holding a score: for pairs, base plus rank; otherwise high and low rank, a suited bonus, a gap penalty and a broadway bonus.
+- A three-card hand scores `best_pair + backup_weight (0.08) × second_best_pair`.
+- All **22,100** three-card deals are sorted once at import. `THREE_PCT` maps each deal to a percentile among all three-card hands. Ranges are written as "top x%" of that list, e.g. `rank < 0.18`.
+- **These percentiles are an order, not equity.** They do not estimate how often a hand wins against any range. They count ordered combinations, and the hand-written score decides the order. Two hands one percentile apart can have quite different real equity. The code does not compute preflop equity probabilities.
+- `strength()` is an exact best-five evaluator for 5–7 cards. It uses rank counts and per-suit bitmasks; a straight is a 5-bit sliding window.
+- `tier()` buckets postflop hands: 3 strong, 2 top pair or overpair, 1 weak or draw, 0 air. A hand that does not beat the board on its own gets tier 0. Board trips that only improve the kicker get tier 1.
 
-For each of the three possible discards the bot computes a keep score:
+### Hardcoded premium behaviour (`aggression.premium_action`)
 
-- made-hand category weight (pair to straight flush), pair rank and kickers;
-- flush and straight **outs**, counted against every card it has seen, including its own discard;
-- nut-flush draws weighted up; non-nut draws discounted as more opponents stay in, because they are also choosing their best two from three;
-- weak pairs (below the top board card) penalized by the number of opponents and by preflop raise pressure.
+This runs before every other preflop rule. A hand qualifies if **any two of its three cards** make AA, KK, QQ or AK (suited or offsuit). Percentile does not matter.
 
-It then picks which kept card to show. By default it reveals the card that tells opponents least, i.e. the one with the fewest rank and suit matches on the board. 20% of the time it reveals the more informative card, so the reveal alone does not give its hand away. That 20% is decided by a hash of the hand number and seat (Knuth multiplicative constants) rather than a random number generator, so a replay produces the same decisions.
+| Situation | AA / KK | QQ / AK |
+|---|---|---|
+| Unopened | Raise to `stack_open_deep` (2.5) × bb | same |
+| Facing one raise | 3-bet to 3 × raise | 3-bet to 3 × raise, but only if that costs ≤ 40% of the effective stack (`premium_value_raise_max_fraction`). Otherwise call. |
+| Facing 2+ raises or a jam | Raise to the maximum (all-in). Heads-up against a jam: call. | Call |
 
-### 3. Preflop policy: `stack.py`, `strategy.py`, `aggression.py`
+These hands never fold preflop.
 
-- **Short stacks (≤ 10 bb, 12 bb heads-up, 8 bb with big antes):** push/fold. Ranges depend on how many players are left to act behind and get wider at 4-, 3- and 2-handed.
-- **Deeper stacks:** open-raise with position-dependent ranges (12% early up to 35% small blind; 68% heads-up from the button). Open size is 2.0, 2.2 or 2.5 bb depending on depth, plus one bb per limper. Deep stacks can open speculative three-card structures in position: a pair plus a spare card, a suited ace, or connected cards.
-- **Facing a raise:** a narrow 3-bet range (3.2× out of position, 2.7× in position), widened against seats that open wide or fold too much. Defending a min-raise from the big blind is wider. 4-bet pots shrink to roughly the top 1.5–3.5%.
-- **Premium floor:** if any two of the three cards make AA, KK, QQ or AK, the bot never folds preflop. It value-raises when the raise costs ≤ 40% of the effective stack, and calls otherwise.
-- **Bubble and payouts:** `risk_factor()` is a cheap ICM proxy. Its size depends on how flat the payout table is, whether we are one place from the money, and whether a short stack is still at the table. It narrows every range and raises every calling price. It only applies when the opponent covers us.
+### Stack and position adjustments (`stack.py`)
 
-### 4. Postflop policy: `stack.py`
+- **Position.** Seats are counted only among players who have not busted, so the blinds and "players behind" stay correct after eliminations. Heads-up, the button posts the small blind.
+- **Push/fold zone.** The effective stack is at or below `push_bb` (10 bb). The limit is 12 bb heads-up, and 8 bb at 7+ players when the ante is at least 15% of the big blind.
+  - 4-handed: shove the top 35% of hands, except the big blind checks when the pot is unraised.
+  - 3-handed and heads-up: separate shove and call-the-shove ranges.
+  - 5+ players: falls through to the V2 `strategy.decide()` push table, which depends on players behind.
+- **Deeper stacks.**
+  - **Open-raise ranges by position:** early 12%, middle 18%, late 28%, small blind 35%. Short-handed overrides replace these: heads-up 68%, 3-handed 50%, 4-handed 35%.
+  - **Open size:** 2.5 bb from 50 bb, 2.2 bb from 25 bb, else 2.0 bb, plus 1 bb per limper.
+  - **Speculative hands at ≥ 50 bb:** `speculative()` is a pair plus a spare card, a suited ace, or three cards within a 5-rank span. These get +8% to the opening range in position, and can flat cheap raises from seats flagged as wide.
+- **Facing raises.**
+  - **3-bet range:** 10% (`aggressive_threebet_pct`), widened against seats with the *wide-opener* signal.
+  - **Narrower ranges after more raises:** 3.5% facing a 3-bet, 1.5% beyond that.
+  - **Large 3-bets:** a 3-bet that would put in ≥ 40% of the effective stack is made only with the top 2% of hands. Otherwise the hand calls, but only within capped pot odds and stack fraction.
+- **Payout risk.**
+  - `risk_factor()` is a cheap stand-in for ICM, capped at 0.6. It is larger with flatter payouts, on the bubble, and when a short stack is still alive. It applies only against an opponent who covers us.
+  - It shrinks ranges and raises calling prices across preflop, postflop and the river. Exact ICM is not computed.
+- **Postflop.**
+  - **Tier 3 (strong):** value-bet 70–90% of the pot; more against stations, overcallers and when deep. On a four-flush or four-straight board that the hand does not beat, slow down when facing a bet. On the flop, two pair is not committed when SPR > 1.5.
+  - **Tier 2 (one pair, overpair):** pot control, with capped bet sizes when deep. Fold to a raise after we bet, unless the raiser has the *bluff* signal.
+  - **Tier 1 (weak, draw):** call only at a good price and for a small fraction of the stack.
+  - **Tier 0 (air):** only a heads-up continuation bet by the preflop raiser on the flop or turn, at 65% frequency. Never on the river, never against a station, never after our turn bet was called.
+  - **River calls:** without a proof or a priced decision, the river calls only with tier 3, or with a tier-2 one-pair hand at ≤ 20% odds (`fix_river_calls`).
+  - **Opponent shows a winner:** if an opponent's exposed cards already beat us on the visible board, the hand is never played aggressively.
 
-- Strong hands bet 70–90% pot. The bet is larger against calling stations, and against seats that have been seen calling expensive bets with weak hands.
-- Strong hands are held back on a four-flush or four-straight board that they do not beat.
-- One-pair hands get pot control: capped bet sizes when deep, and folds to raises after we have bet. That rule is loosened only against seats with measured bluffing evidence.
-- Bluffs are limited to heads-up continuation bets by the preflop raiser on the flop and turn. They are never fired on the river, against calling stations, or after the turn bet was called.
-- If an opponent's exposed cards already beat our hand on the visible board, the hand is never played aggressively.
+### Selection and exposure (`selection.py`)
 
-### 5. River math: `river.py`
+1. **Score each discard.** `keep_score()` scores each of the three possible discards using:
+   - category weight (`select_category`), pair rank and kickers;
+   - flush and straight **outs**, counted after removing all three of our original cards and the board;
+   - nut-flush draws weighted ×1.15; other draws discounted as more opponents remain, since they are also choosing their best two of three;
+   - weak pairs penalized per extra opponent and per preflop raise.
 
-When heads-up on the river, facing a bet, against an opponent showing one card:
+   The best keep wins.
+2. **Break near-ties.** If several keeps make the same hand within `exposure_keep_tie` (0.05), pick the keep whose shown card can tell opponents least.
+3. **Choose what to expose.** By default, expose the kept card that matches the fewest board ranks, then the fewest board suits, then has the lowest rank. With probability `expose_connected_probability` (20%), expose the more informative card instead, so the exposed card is not a reliable tell. This only happens when we have chips and an opponent can still act.
+4. **No RNG.** The 20% coin flip is a multiplicative hash of hand number and seat, so the same state always gives the same action.
 
-1. Build the set of dead cards: our hand, the board, every revealed card, and our own discard.
-2. Enumerate every live card the opponent could hold next to the exposed one (≤ 44). Cards with the same rank and the same flush relevance score the same, so they are evaluated once and cached.
-3. Count how many we beat, tie and lose to. If we beat all of them, call. If we lose to all of them, fold. If the worst case is a tie and pot odds are at least 2:1, call. These rules hold whatever the range weights are, so nothing later can override them.
-4. If none of those apply, weight the outcomes: hands that only play the board count as bluffs (weight 0.12, rising with observed bluffs), weak pairs 0.25, top pair 0.60, two pair or better 1.0. Call if weighted equity is at least `call / eligible_pot + risk premium`.
+`cards.select()` (category first, with a draw/pair bonus) is the older V2 rule. It is still used if `fix_selection` is off, or if selection is somehow called without exactly three cards and three board cards.
 
-`eligible_pot()` rebuilds each seat's contribution from the action history, so the price uses only the part of the pot we can actually win (side-pot safe). If the history does not add up to the reported pot, the bot skips the equity-based call and acts only on the proofs.
+### Opponent observations in table memory (`opp.py`, `tag_opp.py`, `diagnostics.py`)
 
-### 6. Opponent model: `opp.py`, `tag_opp.py`
+Everything comes from public events. No hidden hole cards are inferred, and opponents' discards are never visible.
 
-The model only uses information from the public event stream. It never tries to infer hidden cards.
+- **Base counters** (`opp.update_data`). One pass over `state.events`. It tracks per seat, with every counter multiplied by `decay` = 0.985 at each new hand:
+  - VPIP and PFR;
+  - fold vs. fold opportunities;
+  - 3-bet vs. 3-bet opportunities;
+  - all-ins, raises and calls.
 
-- **Per-seat decayed counters:** VPIP, PFR, fold-to-raise, 3-bet, all-in, aggression. Each counter is multiplied by 0.985 every hand, so old hands fade out.
-- **Beta-style priors:** each rate starts from a prior worth 10 pseudo-hands (VPIP 25%, PFR 15%, fold 45%). The first few hands therefore cannot push the model to an extreme.
-- **Labels:** *station* (VPIP ≥ 40% and fold ≤ 40%), *folder* (fold ≥ 70%, or a seat that never voluntarily puts chips in), *exploitable 3-bet target*.
-- **Evidence signals (V3):**
-  - opening wider than expected for the seat's position;
-  - 3-betting too often;
-  - showing down a river bluff;
-  - calling expensive bets and then showing a weak hand.
+  It also follows every seat's chips and bets through the hand. Rates use pseudo-count priors (`prior_weight` 10; VPIP 0.25, PFR 0.15, fold 0.45).
+- **Seat labels** (`stack.opponent_modes`, after ≥ 6 observed hands):
+  - **station:** VPIP ≥ 40% and fold ≤ 40%.
+  - **folder:** fold ≥ 70%, or ≥ 8 actions and none voluntary.
+  - **exploit seat:** ≥ 8 fold chances and ≥ 80% folds, plus whether its 3-bets look genuine.
 
-  Each signal uses a confidence lower bound. It stays at 0 until the lower bound clears a threshold, then ramps up as more observations arrive.
-- **Serialization:** everything is packed with `struct` into a versioned binary blob (`BA03` magic, table id, one fixed-width row per seat, 196 bytes per seat). A `V5G1` header holds telemetry for the last decision: equity, required equity, risk premium, and which rule fired. If the blob does not decode or belongs to a different table id, the bot starts over with the priors.
+  `opp.modes()` (12-hand minimum) is the older version. It is still defined but not called.
+- **Evidence signals** (`tag_opp.observe` / `signals`):
+  - opens wider than its positional expectation;
+  - 3-bets more often than the prior;
+  - calls expensive bets (≥ 25% pot odds);
+  - shows down a river bluff after raising;
+  - shows down a weak hand after calling the river.
 
-## Development history
+  Each signal is a confidence lower bound minus a target, ramped up between a minimum and a full sample size. It stays 0 until the evidence is strong. `wide`, `bluff` and `overcall` affect decisions. `reraise` is computed but not currently read by any policy.
+- **Wire format.** A little-endian `struct` blob, written last-to-first as follows:
+  - 4-byte `V5G1` diagnostics header (equity, required equity, risk and action premiums, call price, eligible pot, action, reason code);
+  - `BA03` header and the table id;
+  - one 196-byte row per seat (24 counters, chips, bet).
 
-The parameters in `params.py` are layered by version. Each layer can be turned off separately, which made it possible to compare versions with one change removed at a time:
+  For 8 seats that is about 1.7 KB, well under the 16 KB the code allows. Decoding is all-or-nothing. Wrong magic, seat count, length or table id discards the blob and starts from the priors. Unwrapping also accepts the old `V5D1` header.
 
-| Version | Added |
+### Heads-up river enumeration (`river.py`)
+
+Runs only when **exactly one** other player is still in and has 1 or 2 shown cards.
+
+1. **Dead cards:** our two cards, the board, the opponent's shown cards, every other seat's shown cards, cards revealed in this hand's history, and **our own** discard (`state.variant["discarded"]`). Opponents' discards are unknown, so their cards stay in the candidate set.
+2. **Candidates:** with one exposed card, every remaining card is a possible hidden card (about 40). Cards with the same rank and the same relation to a four-flush suit score the same, so `strength()` runs once per class. With two exposed cards there is exactly one outcome.
+3. **Counts:** wins, ties and losses against each candidate. These are **unweighted**.
+
+**Exact bounds (always correct for the candidate set):**
+
+| Reason | Condition | Action |
+|---|---|---|
+| 1 `guaranteed_win` | we beat every candidate | call |
+| 2 `guaranteed_loss` | we lose to every candidate | fold |
+| 3 `nonlosing_tie_bound` | no candidate beats us, and required equity ≤ 0.5 | call |
+
+Reason 3 lives in `decide_river()`, so the final step does not reapply it the way it reapplies 1 and 2. It is still protected from the commitment override.
+
+**Heuristic weighted equity (reason 4):**
+- Each candidate gets a weight: does not beat the board, or high card → bluff weight (0.12, plus 0.80 × the seat's `bluff` signal); a pair below the top board card → 0.25; top pair or better pair → 0.60; two pair or better → 1.0.
+- Weighted equity is compared against `required = call / eligible_pot` plus a premium. The premium has two parts: `risk × 0.10`, and +0.025 when there has been a river re-raise (reduced by bluff evidence).
+- **These weights are hand-picked numbers, not a fitted range model.** Reason 4 is an estimate. Reasons 1–3 are exact.
+
+**Eligible pot and ties:**
+- `eligible_pot()` rebuilds each seat's contribution from `state.history`. It caps every other seat at what we will have put in after calling, so we only count chips we can win.
+- If the rebuilt total differs from `state.pot` by more than one chip, it returns `None`. Proofs 1–2 still apply, but reason 3–4 calls are skipped and normal strategy takes over.
+- A tie counts as half the pot. That is correct heads-up, which is the only case this module handles.
+
+**Multiway limits:**
+- With two or more opponents there is no enumeration. The river falls back to the tiers and price rules in `stack.postflop`.
+- Side pots are not split per opponent.
+- The other non-folded players' hidden cards are not modelled.
+
+### Stack-to-pot commitment (`aggression.commitment_action`)
+
+- **When it applies:** postflop, facing a bet, holding an overpair, top pair with a Q+ kicker, or tier 3. If an opponent's shown cards already beat us on the board, it does nothing.
+- **What it does:** calls when any of these holds:
+  - SPR before the current bet ≤ 3;
+  - we have already put in ≥ 30% of our starting stack;
+  - (flop only, heads-up) KK+ overpair with SPR ≤ 6.
+- **Why SPR is measured before the bet:** so a huge overbet does not on its own count as pot commitment.
+
+### Parameters: which ones are used
+
+`params.py` adds a block of settings for each version. Behaviour comes from what the code actually reads, not from the names. Switches currently on: `v5_river`, `v5_preflop`, `river_guard_enabled`, `river_price_authoritative`, `diagnostics_enabled`, `premium_floor_enabled`, `commitment_enabled`, `short_open_enabled`, `wider_threebet_enabled`, `flop_guard_enabled`, `fix_short_ranges`, `fix_river_calls`, `fix_selection`.
+
+Defined but **never read** by any module, so they have no effect:
+
+- `version`
+- `tag_enabled` (despite the comment, it does not gate the V3 signals; those are always computed and used)
+- `premium_king_jam_bb`, `premium_queen_jam_bb`, `premium_queen_call_fraction`, `premium_king_call_fraction`
+- `tag_open_tighten`, `tag_call_tighten`, `tag_deep_bb`, `tag_no_tighten_bb`, `tag_ante_relief`, `tag_late_relief`, `tag_defend_extra`, `tag_max_defend_odds`, `tag_max_flat_stack_fraction`, `tag_weak_bluffcatch_extra`, `tag_trap_min_bb`, `tag_trap_min_spr`, `tag_value_bet_extra`, `tag_risk_strength`, `tag_cap_pressure_hands`
+
+`min_hands` is read only by the unused `opp.modes()`. The later `tag_min_observations` / `tag_full_observations` values (6 / 24) override the earlier ones (12 / 40), because each `P.update` block replaces earlier keys.
+
+---
+
+## 3. History
+
+| Layer | Content |
 |---|---|
-| V2 | Three-card ranking table, exact evaluator, position-aware push/fold. Kept frozen as the baseline. |
-| V3 | Public-evidence opponent signals (wide opens, over-calls, river bluffs). |
-| V4 | Stack-depth-aware opening, sizing and pot control; better discard scoring; corrected short-handed ranges. |
-| V5 | Exact river bounds and proofs, side-pot-aware pricing, decision telemetry in memory. |
+| V2 | Three-card ranking, evaluator, position-aware push/fold (`strategy.decide`). The params comment calls it the submitted baseline. |
+| V3 | Public-evidence counters and signals (`tag_opp`). |
+| V4 | Stack-aware policy (`stack.py`), new discard scoring, corrected short-handed ranges. |
+| V5 | River proofs, priced river decisions, eligible-pot rebuild, telemetry, river precedence in `agent.py`. |
 
-## Layout
+This repository does not contain match logs, a test harness or tournament results. No performance claims are made here.
 
-```
-bot/
-  agent.py        entry point: Agent.act(state, memory) -> (action, memory)
-  params.py       every tunable number, grouped by version
-  cards.py        evaluator, three-card preflop table, postflop tiers
-  selection.py    discard / reveal choice
-  stack.py        preflop + postflop policy, position, ICM-style risk factor
-  strategy.py     V2 baseline policy and legal-action helpers
-  aggression.py   premium-hand floor, stack-to-pot commitment
-  river.py        exact river enumeration and range-weighted equity
-  opp.py          decayed Bayesian seat statistics (BA02 format)
-  tag_opp.py      V3 evidence signals (BA03 format)
-  diagnostics.py  telemetry header packed into memory
+---
+
+## 4. Validation and packaging
+
+This repository is a **submission bundle**, not the full starter kit. The SDK (`poker_agent_sdk`), the local engine, the example bots and the `poker-agent` CLI come with the organizers' kit and are not included.
+
+With the kit installed, from the repository root:
+
+```bash
+poker-agent check agent.py          # contract / legality check
+poker-agent pack . bot.zip          # build the submission ZIP
 ```
 
-The modules import each other as `bot.*`. Put the repository root on `PYTHONPATH`, install the organizers' `poker_agent_sdk`, and the engine loads `bot.agent.Agent`.
+`poker-agent play` needs the kit's `examples/` opponents, which are not in this repository.
+
+**Submission ZIP layout:**
+- `agent.py` at the root, with `bot/` next to it. Maximum 50 MB.
+- Do not include the SDK, a virtual environment, credentials or the local engine.
+
+---
+
+## Unverified assumptions / open questions
+
+- **1 ms budget:** not measured here. The heaviest work is import time (the 22,100-deal table); per decision the work is at most ~40 river evaluations plus one pass over new events.
+- **Reveal frequency:** the 20% "informative reveal" rate and the river range weights are hand-set. Their effect has not been measured in this repository.
+- **Multiway `shown_cards`:** in multiway pots `shown_cards` from other seats are treated as dead cards. If the engine ever reports shown cards differently, `bounds()` returns `None` and the bot falls back to normal strategy.
