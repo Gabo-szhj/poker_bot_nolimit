@@ -225,7 +225,7 @@ Reason 3 lives in `decide_river()`, so the final step does not reapply it the wa
 - **What it does:** calls when any of these holds:
   - SPR before the current bet ≤ 3;
   - we have already put in ≥ 30% of our starting stack;
-  - (flop only, heads-up) KK+ overpair with SPR ≤ 6.
+  - (flop only, facing a single bettor this street) KK+ overpair with SPR ≤ 6.
 - **Why SPR is measured before the bet:** so a huge overbet does not on its own count as pot commitment.
 
 ### Parameters: which ones are used
